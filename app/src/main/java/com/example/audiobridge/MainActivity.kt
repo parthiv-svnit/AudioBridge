@@ -10,7 +10,11 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
-import androidx.compose.runtime.*
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.collectAsState
 import androidx.core.content.ContextCompat
 import com.example.audiobridge.service.AudioCaptureService
 import com.example.audiobridge.ui.AudioBridgeNavigation
@@ -18,33 +22,28 @@ import com.example.audiobridge.ui.AudioBridgeTheme
 import com.example.audiobridge.viewmodel.StreamViewModel
 
 /**
- * MainActivity — entry point.
+ * MainActivity — app entry point.
  *
  * Backend responsibilities (this file):
- *   - Register MediaProjection ActivityResultLauncher
- *   - Register runtime permission launcher (RECORD_AUDIO, POST_NOTIFICATIONS)
- *   - Wire ViewModel to launchers
- *   - Mount Gemini's Compose UI and pass ViewModel state down
+ *   - Register MediaProjection launcher (before onCreate)
+ *   - Register runtime permission launcher (before onCreate)
+ *   - Wire both launchers to ViewModel
+ *   - Mount Gemini's Compose UI tree
  *
  * UI responsibilities (Gemini):
- *   - AudioBridgeTheme, AudioBridgeNavigation and all composables
+ *   - AudioBridgeTheme { ... }
+ *   - AudioBridgeNavigation(...)
+ *   - All composable screens
  */
 class MainActivity : ComponentActivity() {
 
-    // ── ViewModel ─────────────────────────────────────────────────────────────
     private val viewModel: StreamViewModel by viewModels()
 
     // ── MediaProjection launcher ──────────────────────────────────────────────
-    // Must be registered before onCreate completes (Android framework requirement).
-    //
+    // Registered here (not in onCreate) — Android requires this before onCreate.
     // Flow:
-    //   UI taps Start
-    //   → viewModel.onStartStream(ip, port)
-    //   → viewModel.requestProjectionLauncher() ← wired to this launcher below
-    //   → system dialog appears
-    //   → result arrives here
-    //   → viewModel.onMediaProjectionResult(resultCode, data)
-    //   → ViewModel creates MediaProjection and starts AudioCaptureService
+    //   Start tapped → viewModel.onStartStream() → requestProjectionLauncher()
+    //   → system dialog → result lands here → viewModel.onMediaProjectionResult()
     private val mediaProjectionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
@@ -52,16 +51,14 @@ class MainActivity : ComponentActivity() {
     }
 
     // ── Permission launcher ───────────────────────────────────────────────────
-    // Requests RECORD_AUDIO + POST_NOTIFICATIONS together.
-    // Gemini's PermissionScreen fires onRequestPermissions → triggers this.
-    private var onPermissionResult: ((Boolean) -> Unit)? = null
+    private var permissionCallback: ((Boolean) -> Unit)? = null
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { grants ->
         val allGranted = grants.values.all { it }
-        onPermissionResult?.invoke(allGranted)
-        onPermissionResult = null
+        permissionCallback?.invoke(allGranted)
+        permissionCallback = null
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -69,7 +66,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Wire ViewModel's projection trigger to our registered launcher
+        // Wire ViewModel's projection trigger to our launcher
         val projManager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         viewModel.requestProjectionLauncher = {
             mediaProjectionLauncher.launch(projManager.createScreenCaptureIntent())
@@ -77,91 +74,65 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             AudioBridgeTheme {
-
-                // Collect state from Claude's ViewModel
+                // Collect from Claude's ViewModel
                 val streamState by viewModel.streamState.collectAsState()
                 val audioLevel  by viewModel.audioLevel.collectAsState()
 
-                // Permission state — drives which screen Gemini's nav shows
-                var hasPermissions by remember { mutableStateOf(checkInitialPermissions()) }
+                // Track permission state — drives which screen Gemini shows first
+                var hasPermissions by remember { mutableStateOf(checkPermissions()) }
 
-                // Mount Gemini's navigation tree
                 AudioBridgeNavigation(
-                    hasPermissions = hasPermissions,
-                    streamState    = streamState,
-                    audioLevel     = audioLevel,
-
-                    // Claude's ViewModel exposes savedIp both as property and getSavedIp()
-                    savedIp        = viewModel.getSavedIp(),
-
-                    // ── Name bridge ───────────────────────────────────────────
-                    // Gemini calls: onStartClick(ip, port)
-                    // Claude has:   onStartStream(ip, port)
-                    onStartClick   = { ip, port -> viewModel.onStartStream(ip, port) },
-
-                    // Gemini calls: onStopClick()
-                    // Claude has:   onStopStream()
-                    onStopClick    = { viewModel.onStopStream() },
-
-                    // Gemini's PermissionScreen calls this when user taps "Grant"
+                    hasPermissions       = hasPermissions,
+                    streamState          = streamState,
+                    audioLevel           = audioLevel,
+                    savedIp              = viewModel.getSavedIp(),
+                    onStartClick         = { ip, port -> viewModel.onStartStream(ip, port) },
+                    onStopClick          = { viewModel.onStopStream() },
                     onRequestPermissions = {
-                        requestRequiredPermissions { granted ->
-                            hasPermissions = granted
-                        }
+                        askPermissions { granted -> hasPermissions = granted }
                     }
                 )
             }
         }
     }
 
-    // ─── Permission helpers ───────────────────────────────────────────────────
+    // ─── Permissions ──────────────────────────────────────────────────────────
 
     /**
-     * Returns true if all required runtime permissions are already granted.
-     * Called once at startup to decide whether to show PermissionScreen.
-     *
-     * RECORD_AUDIO         — required by AudioPlaybackCaptureConfiguration
-     * POST_NOTIFICATIONS   — required by foreground notification on Android 13+
+     * Returns true if all required permissions are already granted.
+     * RECORD_AUDIO        — required for AudioPlaybackCaptureConfiguration
+     * POST_NOTIFICATIONS  — required for foreground notification on API 33+
      */
-    private fun checkInitialPermissions(): Boolean {
-        val recordAudio = ContextCompat.checkSelfPermission(
+    private fun checkPermissions(): Boolean {
+        val audio = ContextCompat.checkSelfPermission(
             this, Manifest.permission.RECORD_AUDIO
         ) == PackageManager.PERMISSION_GRANTED
 
-        // POST_NOTIFICATIONS only exists on Android 13+ (API 33).
-        // On older versions it is implicitly granted — return true.
-        val postNotifications = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        val notify = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             ContextCompat.checkSelfPermission(
                 this, Manifest.permission.POST_NOTIFICATIONS
             ) == PackageManager.PERMISSION_GRANTED
         } else {
-            true
+            true // implicitly granted below API 33
         }
 
-        return recordAudio && postNotifications
+        return audio && notify
     }
 
-    /**
-     * Launch the runtime permission dialog for all required permissions.
-     * [onResult] is called with true only if every permission was granted.
-     */
-    private fun requestRequiredPermissions(onResult: (Boolean) -> Unit) {
-        val permissions = buildList {
+    private fun askPermissions(onResult: (Boolean) -> Unit) {
+        val perms = buildList {
             add(Manifest.permission.RECORD_AUDIO)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 add(Manifest.permission.POST_NOTIFICATIONS)
             }
         }.toTypedArray()
 
-        onPermissionResult = onResult
-        permissionLauncher.launch(permissions)
+        permissionCallback = onResult
+        permissionLauncher.launch(perms)
     }
 
-    // ─── Notification Stop action ─────────────────────────────────────────────
+    // ─── Notification Stop while foregrounded ────────────────────────────────
 
-    /**
-     * Handle Stop action from the foreground notification if Activity is open.
-     */
     override fun onNewIntent(intent: Intent?) {
         super.onNewIntent(intent)
         if (intent?.action == AudioCaptureService.ACTION_STOP) {
