@@ -1,8 +1,5 @@
 package com.example.audiobridge.service
 
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.media.AudioFormat
@@ -11,95 +8,85 @@ import android.media.AudioRecord
 import android.media.projection.MediaProjection
 import android.os.IBinder
 import android.util.Log
-import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlin.math.abs
 
-/**
- * AudioCaptureService — foreground service for system audio capture + UDP streaming.
- *
- * ── CRITICAL DESIGN NOTE: MediaProjection handoff ──────────────────────────────
- * MediaProjection is NOT Parcelable and cannot be passed via Intent extras.
- * Instead, ViewModel stores it in [pendingProjection] before calling startForegroundService().
- * The service reads and clears it in onStartCommand(). This is the standard pattern.
- * ──────────────────────────────────────────────────────────────────────────────
- *
- * Audio format: PCM_16BIT, 48000 Hz, Stereo, ~10ms chunks (1920 bytes each)
- */
 class AudioCaptureService : Service() {
 
     companion object {
         private const val TAG = "AudioCaptureService"
 
-        // ── Intent extras ────────────────────────────────────────────────────
-        const val EXTRA_TARGET_IP   = "extra_target_ip"
-        const val EXTRA_TARGET_PORT = "extra_target_port"
-        const val ACTION_STOP       = "com.example.audiobridge.ACTION_STOP"
+        private const val SAMPLE_RATE_PRIMARY   = 48000
+        private const val CHANNEL_CONFIG        = AudioFormat.CHANNEL_IN_STEREO
+        private const val AUDIO_ENCODING        = AudioFormat.ENCODING_PCM_16BIT
+        private const val BYTES_PER_SAMPLE      = 2
+        private const val CHANNELS              = 2
+        private const val CHUNK_MS              = 10
 
-        // ── Notification ─────────────────────────────────────────────────────
-        const val NOTIFICATION_ID      = 1001
-        const val NOTIFICATION_CHANNEL = "audiobridge_stream"
+        private fun chunkSize(sampleRate: Int): Int =
+            sampleRate * CHANNELS * BYTES_PER_SAMPLE * CHUNK_MS / 1000
 
-        // ── Audio config — plain Int values, NOT AudioFormat.* constants ─────
-        // (AudioFormat.* are not const, so they can't be used in const val)
-        const val SAMPLE_RATE   = 48000
-        const val CHANNEL_COUNT = 2
-        const val BYTES_PER_SAMPLE = 2      // PCM_16BIT
-        const val BYTES_PER_FRAME  = CHANNEL_COUNT * BYTES_PER_SAMPLE   // = 4
-        const val CHUNK_MS         = 10
-        const val CHUNK_FRAMES     = SAMPLE_RATE / 1000 * CHUNK_MS       // = 480
-        const val CHUNK_BYTES      = CHUNK_FRAMES * BYTES_PER_FRAME      // = 1920
+        const val EXTRA_RESULT_CODE      = "extra_result_code"
+        const val EXTRA_RESULT_DATA      = "extra_result_data"
+        const val EXTRA_TARGET_IP        = "extra_target_ip"
+        const val EXTRA_TARGET_PORT      = "extra_target_port"
 
-        // ── Shared state (ViewModel observes these) ──────────────────────────
+        const val NOTIFICATION_ID        = 1001
+        const val CHANNEL_ID             = "audiobridge_channel"
+
+        const val ACTION_STOP            = "com.example.audiobridge.ACTION_STOP"
+
         val audioLevel  = MutableStateFlow(0f)
         val lastError   = MutableStateFlow<String?>(null)
-        val isStreaming = MutableStateFlow(false)
-
-        /**
-         * MediaProjection handoff point.
-         * ViewModel sets this BEFORE calling startForegroundService().
-         * Service reads and clears it in onStartCommand().
-         * Volatile so both threads see the write immediately.
-         */
-        @Volatile var pendingProjection: MediaProjection? = null
     }
 
     private var audioRecord: AudioRecord? = null
-    private var udpSender: UDPSender? = null
+    private val udpSender   = UDPSender()
     private var captureThread: Thread? = null
-    @Volatile private var keepRunning = false
 
-    // ─── Service lifecycle ────────────────────────────────────────────────────
+    @Volatile private var isCapturing = false
+    private var actualSampleRate = SAMPLE_RATE_PRIMARY
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-
         if (intent?.action == ACTION_STOP) {
             stopCapture()
             stopSelf()
             return START_NOT_STICKY
         }
 
-        // Collect MediaProjection from static handoff — NOT from Intent
-        val projection = pendingProjection
-        pendingProjection = null // clear immediately
+        val notification = buildForegroundNotification(intent)
+        startForeground(NOTIFICATION_ID, notification)
 
-        val ip   = intent?.getStringExtra(EXTRA_TARGET_IP)
-        val port = intent?.getIntExtra(EXTRA_TARGET_PORT, 7355) ?: 7355
+        val targetIp        = intent?.getStringExtra(EXTRA_TARGET_IP)   ?: return START_NOT_STICKY
+        val targetPort      = intent?.getIntExtra(EXTRA_TARGET_PORT, 7355) ?: 7355
 
-        if (projection == null || ip.isNullOrBlank()) {
-            Log.e(TAG, "Missing MediaProjection or IP")
-            lastError.value = "Missing projection or IP"
+        val resultCode = intent?.getIntExtra(EXTRA_RESULT_CODE, android.app.Activity.RESULT_CANCELED) ?: android.app.Activity.RESULT_CANCELED
+        val resultData = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+            intent?.getParcelableExtra(EXTRA_RESULT_DATA, Intent::class.java)
+        } else {
+            @Suppress("DEPRECATION")
+            intent?.getParcelableExtra<Intent>(EXTRA_RESULT_DATA)
+        }
+
+        if (resultData == null || resultCode != android.app.Activity.RESULT_OK) {
+            Log.e(TAG, "Invalid MediaProjection intent")
+            lastError.value = "MediaProjection missing"
             stopSelf()
             return START_NOT_STICKY
         }
 
-        // startForeground must be called before any heavy work
-        ensureNotificationChannel()
-        startForeground(NOTIFICATION_ID, buildNotification(ip, port))
+        val mediaProjectionManager = getSystemService(android.content.Context.MEDIA_PROJECTION_SERVICE) as android.media.projection.MediaProjectionManager
+        val mediaProjection = mediaProjectionManager.getMediaProjection(resultCode, resultData)
 
-        startCapture(projection, ip, port)
+        if (mediaProjection == null) {
+            Log.e(TAG, "Failed to get MediaProjection from system")
+            lastError.value = "Failed to acquire screen capture"
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        startCapture(mediaProjection, targetIp, targetPort)
         return START_NOT_STICKY
     }
 
@@ -108,15 +95,16 @@ class AudioCaptureService : Service() {
         super.onDestroy()
     }
 
-    // ─── Capture ──────────────────────────────────────────────────────────────
-
     private fun startCapture(projection: MediaProjection, ip: String, port: Int) {
-        val sampleRate = resolveSampleRate()
+        if (isCapturing) return
 
-        // CHANNEL_IN_STEREO = AudioFormat.CHANNEL_IN_STEREO (value = 12)
-        val channelConfig = AudioFormat.CHANNEL_IN_STEREO
-        // ENCODING_PCM_16BIT = AudioFormat.ENCODING_PCM_16BIT (value = 2)
-        val encoding = AudioFormat.ENCODING_PCM_16BIT
+        val sampleRate = resolveWorkingSampleRate(projection) ?: run {
+            lastError.value = "Device does not support required audio format"
+            stopSelf()
+            return
+        }
+
+        actualSampleRate = sampleRate
 
         val captureConfig = AudioPlaybackCaptureConfiguration.Builder(projection)
             .addMatchingUsage(android.media.AudioAttributes.USAGE_MEDIA)
@@ -124,155 +112,139 @@ class AudioCaptureService : Service() {
             .addMatchingUsage(android.media.AudioAttributes.USAGE_UNKNOWN)
             .build()
 
-        val minBuffer = AudioRecord.getMinBufferSize(sampleRate, channelConfig, encoding)
-        val bufferSize = maxOf(minBuffer, CHUNK_BYTES * 2)
-
-        val record = AudioRecord.Builder()
-            .setAudioPlaybackCaptureConfig(captureConfig)
-            .setAudioFormat(
-                AudioFormat.Builder()
-                    .setEncoding(encoding)
-                    .setSampleRate(sampleRate)
-                    .setChannelMask(channelConfig)
-                    .build()
-            )
-            .setBufferSizeInBytes(bufferSize)
+        val audioFormat = AudioFormat.Builder()
+            .setEncoding(AUDIO_ENCODING)
+            .setSampleRate(sampleRate)
+            .setChannelMask(CHANNEL_CONFIG)
             .build()
 
-        if (record.state != AudioRecord.STATE_INITIALIZED) {
-            Log.e(TAG, "AudioRecord failed to initialize")
-            lastError.value = "AudioRecord init failed"
+        val minBufferSize = AudioRecord.getMinBufferSize(sampleRate, CHANNEL_CONFIG, AUDIO_ENCODING)
+        val recordBufferSize = maxOf(minBufferSize, chunkSize(sampleRate) * 4)
+
+        audioRecord = AudioRecord.Builder()
+            .setAudioPlaybackCaptureConfig(captureConfig)
+            .setAudioFormat(audioFormat)
+            .setBufferSizeInBytes(recordBufferSize)
+            .build()
+
+        if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
+            lastError.value = "AudioRecord initialization failed"
+            audioRecord?.release()
+            audioRecord = null
             stopSelf()
             return
         }
 
-        audioRecord = record
-        udpSender = UDPSender().also { it.start(ip, port) }
-        keepRunning = true
-        isStreaming.value = true
+        udpSender.start(ip, port)
+        isCapturing = true
+        audioRecord?.startRecording()
 
-        // Raw Thread — NOT coroutine. Coroutine dispatchers add unpredictable jitter.
         captureThread = Thread({
-            Log.i(TAG, "Capture thread started — ${sampleRate}Hz, chunk=${CHUNK_BYTES}B")
-            record.startRecording()
-            captureLoop(record)
-            record.stop()
-            record.release()
-            Log.i(TAG, "Capture thread exited")
-        }, "audiobridge-capture").apply {
-            priority = Thread.MAX_PRIORITY
-            isDaemon = true
-            start()
+            runCaptureLoop(sampleRate)
+        }, "AudioBridge-Capture").also {
+            it.priority = Thread.MAX_PRIORITY
+            it.start()
         }
     }
 
     private fun stopCapture() {
-        keepRunning = false
-        isStreaming.value = false
-        audioLevel.value = 0f
+        if (!isCapturing) return
+        isCapturing = false
 
-        captureThread?.join(500)
+        captureThread?.interrupt()
         captureThread = null
 
-        udpSender?.stop()
-        udpSender = null
-        audioRecord = null // AudioRecord released inside captureLoop after it exits
+        audioRecord?.stop()
+        audioRecord?.release()
+        audioRecord = null
+
+        udpSender.stop()
+        audioLevel.value = 0f
     }
 
-    // ─── Capture loop ─────────────────────────────────────────────────────────
+    private fun runCaptureLoop(sampleRate: Int) {
+        val chunkBytes = chunkSize(sampleRate)
+        val buffer = ByteArray(chunkBytes)
 
-    private fun captureLoop(record: AudioRecord) {
-        val buffer = ByteArray(CHUNK_BYTES)
-
-        while (keepRunning) {
-            val read = record.read(buffer, 0, buffer.size, AudioRecord.READ_BLOCKING)
+        while (isCapturing && !Thread.currentThread().isInterrupted) {
+            val bytesRead = audioRecord?.read(buffer, 0, chunkBytes) ?: -1
 
             when {
-                read > 0 -> {
-                    // Fire-and-forget — no buffering
-                    udpSender?.send(buffer.copyOf(read))
-                    // Update UI level meter: peak / 32768 → 0.0–1.0
-                    audioLevel.value = computeLevel(buffer, read)
+                bytesRead == chunkBytes -> {
+                    val chunk = buffer.copyOf()
+                    udpSender.enqueue(chunk)
+                    updateAudioLevel(chunk)
                 }
-                read == AudioRecord.ERROR_INVALID_OPERATION -> {
-                    Log.e(TAG, "AudioRecord: ERROR_INVALID_OPERATION")
-                    lastError.value = "Audio capture error"
-                    break
-                }
-                read == AudioRecord.ERROR_BAD_VALUE -> {
-                    Log.e(TAG, "AudioRecord: ERROR_BAD_VALUE")
-                    break
-                }
-                // read == 0 → silence, keep going (stream clock stays alive)
+                bytesRead > 0 -> udpSender.enqueue(buffer.copyOf(bytesRead))
+                bytesRead == AudioRecord.ERROR_INVALID_OPERATION -> break
+                bytesRead == AudioRecord.ERROR_BAD_VALUE -> break
             }
         }
     }
 
-    private fun computeLevel(buffer: ByteArray, length: Int): Float {
+    private fun updateAudioLevel(pcmBytes: ByteArray) {
         var peak = 0
         var i = 0
-        while (i < length - 1) {
-            // Reassemble little-endian 16-bit sample
-            val sample = (buffer[i + 1].toInt() shl 8) or (buffer[i].toInt() and 0xFF)
-            val mag = abs(sample.toShort().toInt())
-            if (mag > peak) peak = mag
+        while (i < pcmBytes.size - 1) {
+            val lo  = pcmBytes[i].toInt() and 0xFF
+            val hi  = pcmBytes[i + 1].toInt()
+            val sample = (hi shl 8) or lo
+            val abs = if (sample < 0) -sample else sample
+            if (abs > peak) peak = abs
             i += 2
         }
-        return (peak / 32768f).coerceIn(0f, 1f)
+        audioLevel.value = peak / 32768f
     }
 
-    // ─── Sample rate ──────────────────────────────────────────────────────────
-
-    private fun resolveSampleRate(): Int {
-        val channelConfig = AudioFormat.CHANNEL_IN_STEREO
-        val encoding = AudioFormat.ENCODING_PCM_16BIT
-
-        if (AudioRecord.getMinBufferSize(SAMPLE_RATE, channelConfig, encoding) > 0) {
-            return SAMPLE_RATE
+    private fun resolveWorkingSampleRate(projection: MediaProjection): Int? {
+        val candidates = listOf(48000, 44100, 22050, 16000)
+        for (rate in candidates) {
+            val size = AudioRecord.getMinBufferSize(rate, CHANNEL_CONFIG, AUDIO_ENCODING)
+            if (size > 0) return rate
         }
-        for (rate in listOf(44100, 22050, 16000)) {
-            if (AudioRecord.getMinBufferSize(rate, channelConfig, encoding) > 0) {
-                Log.w(TAG, "FALLBACK: ${rate}Hz — update SAMPLE_RATE in receiver.py!")
-                return rate
-            }
-        }
-        return SAMPLE_RATE
+        return null
     }
 
-    // ─── Notification ─────────────────────────────────────────────────────────
+    private fun buildForegroundNotification(intent: Intent?): android.app.Notification {
+        val ip   = intent?.getStringExtra(EXTRA_TARGET_IP) ?: "unknown"
+        val port = intent?.getIntExtra(EXTRA_TARGET_PORT, 7355) ?: 7355
 
-    private fun ensureNotificationChannel() {
-        val channel = NotificationChannel(
-            NOTIFICATION_CHANNEL,
-            "AudioBridge Stream",
-            NotificationManager.IMPORTANCE_LOW
-        ).apply {
-            description = "Shown while AudioBridge is streaming"
-            setSound(null, null)
-            enableVibration(false)
-        }
-        getSystemService(NotificationManager::class.java)
-            .createNotificationChannel(channel)
-    }
-
-    private fun buildNotification(ip: String, port: Int): android.app.Notification {
         val stopIntent = Intent(this, AudioCaptureService::class.java).apply {
             action = ACTION_STOP
         }
-        val stopPendingIntent = PendingIntent.getService(
+        val stopPi = android.app.PendingIntent.getService(
             this, 0, stopIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            android.app.PendingIntent.FLAG_IMMUTABLE
         )
 
-        // Using NotificationCompat (from androidx.core, always available)
-        // to avoid raw Notification.Action.Builder icon issues across API levels
-        return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL)
+        return try {
+            val cls    = Class.forName("com.example.audiobridge.ui.NotificationBuilder")
+            val method = cls.getMethod("buildForegroundNotification", android.content.Context::class.java,
+                String::class.java, Int::class.java, android.app.PendingIntent::class.java)
+            method.invoke(null, this, ip, port, stopPi) as android.app.Notification
+        } catch (e: Exception) {
+            buildMinimalNotification(ip, port)
+        }
+    }
+
+    private fun buildMinimalNotification(ip: String, port: Int): android.app.Notification {
+        val nm = getSystemService(NOTIFICATION_SERVICE) as android.app.NotificationManager
+        if (nm.getNotificationChannel(CHANNEL_ID) == null) {
+            val channel = android.app.NotificationChannel(
+                CHANNEL_ID, "AudioBridge Stream", android.app.NotificationManager.IMPORTANCE_LOW
+            )
+            nm.createNotificationChannel(channel)
+        }
+
+        val stopIntent = Intent(this, AudioCaptureService::class.java).apply { action = ACTION_STOP }
+        val stopPi = android.app.PendingIntent.getService(this, 0, stopIntent, android.app.PendingIntent.FLAG_IMMUTABLE)
+
+        return android.app.Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("AudioBridge Active")
             .setContentText("Streaming to $ip:$port")
             .setSmallIcon(android.R.drawable.ic_media_play)
-            .addAction(android.R.drawable.ic_delete, "Stop", stopPendingIntent)
+            .addAction(android.R.drawable.ic_delete, "Stop", stopPi)
             .setOngoing(true)
-            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .build()
     }
 }
